@@ -8,8 +8,11 @@ import (
 	"log"
 	"os"
 	"time"
+	"strings"
+	"strconv"
 
 	v1 "github.com/solo-io/gloo/projects/gloo/pkg/api/v1"
+	"github.com/gogo/protobuf/types"
 	matchers "github.com/solo-io/gloo/projects/gloo/pkg/api/v1/core/matchers"
 	"github.com/solo-io/go-utils/kubeutils"
 	"github.com/solo-io/solo-kit/pkg/api/v1/clients"
@@ -51,6 +54,7 @@ func main() {
 // we received a new list of upstreams! regenerate the desired proxy
 // and write it as a CRD to Kubernetes
 func resync(ctx context.Context, upstreams v1.UpstreamList, client v1.ProxyClient) {
+
 	desiredProxy := makeDesiredProxy(upstreams)
 
 	// see if the proxy exists. if yes, update; if no, create
@@ -74,6 +78,22 @@ func resync(ctx context.Context, upstreams v1.UpstreamList, client v1.ProxyClien
 
 		// update the resource version on our desired proxy
 		desiredProxy.Metadata.ResourceVersion = existingProxy.Metadata.ResourceVersion
+	}
+
+	// see if the proxy exists. if yes, update; if no, create
+	gatewayProxy, err := client.Read(
+		"gloo-system",
+		"gateway-proxy",
+		clients.ReadOpts{Ctx: ctx})
+
+  log.Printf(" Need to merg? %+v\n", err)
+	// gateway-proxy exists! merge
+	if err == nil {
+		glooVirtualHosts := gatewayProxy.Listeners[0].ListenerType.(*v1.Listener_HttpListener).HttpListener.VirtualHosts
+		for _, virtualHost := range glooVirtualHosts {
+			log.Printf(" merging\n")
+			desiredProxy.Listeners[0].ListenerType.(*v1.Listener_HttpListener).HttpListener.VirtualHosts = append(desiredProxy.Listeners[0].ListenerType.(*v1.Listener_HttpListener).HttpListener.VirtualHosts, virtualHost)
+		}
 	}
 
 	// write!
@@ -136,56 +156,93 @@ func makeDesiredProxy(upstreams v1.UpstreamList) *v1.Proxy {
 
 	for _, upstream := range upstreams {
 		upstreamRef := upstream.Metadata.Ref()
-		// create a virtual host for each upstream
-		vHostForUpstream := &v1.VirtualHost{
-			// logical name of the virtual host, should be unique across vhosts
-			Name: upstream.Metadata.Name,
 
-			// the domain will be our "matcher".
-			// requests with the Host header equal to the upstream name
-			// will be routed to this upstream
-			Domains: []string{upstream.Metadata.Name},
+	  switch upstream.UpstreamType.(type) {
+		case *v1.Upstream_Consul:
+			log.Printf("  consul\n")
 
-			// we'll create just one route designed to match any request
-			// and send it to the upstream for this domain
-			Routes: []*v1.Route{{
-				// use a basic catch-all matcher
-				Matchers: []*matchers.Matcher{
-					&matchers.Matcher{
-						PathSpecifier: &matchers.Matcher_Prefix{
-							Prefix: "/",
-						},
-					},
-				},
+			useGloo := false
+			autoHostRewrite := false
+			pathPrefix := "/"
+			var err error
 
-				// tell Gloo where to send the requests
-				Action: &v1.Route_RouteAction{
-					RouteAction: &v1.RouteAction{
-						Destination: &v1.RouteAction_Single{
-							// single destination
-							Single: &v1.Destination{
-								DestinationType: &v1.Destination_Upstream{
-									// a "reference" to the upstream, which is a Namespace/Name tuple
-									Upstream: &upstreamRef,
-								},
-							},
-						},
-						HostRewriteSpecifier: &envoyroute.RouteAction_AutoHostRewrite{
-              AutoHostRewrite: &wrappers.BoolValue{
-                Value: true,
+			for _, tag := range upstream.GetConsul().ServiceTags {
+		    if tag == "gloo=true" {
+			    useGloo = true
+		    } else if strings.HasPrefix(tag, "autoHostRewrite"){
+          log.Printf("autoHostRewrite: %+v\n", tag)
+					namevalue := strings.Split(tag, "=")
+					autoHostRewrite, err = strconv.ParseBool(namevalue[1])
+					must(err)
+				} else if strings.HasPrefix(tag, "pathPrefix"){
+          log.Printf("pathPrefix: %+v\n", tag)
+					namevalue := strings.Split(tag, "=")
+					pathPrefix = namevalue[1]
+				}
+		  }
+
+			if useGloo {
+		    // create a virtual host for each upstream
+		    vHostForUpstream := &v1.VirtualHost{
+			    // logical name of the virtual host, should be unique across vhosts
+			    Name: upstream.Metadata.Name,
+
+			    // the domain will be our "matcher".
+			    // requests with the Host header equal to the upstream name
+			    // will be routed to this upstream
+			    Domains: []string{upstream.Metadata.Name},
+
+		      // we'll create just one route designed to match any request
+		      // and send it to the upstream for this domain
+		  	  Routes: []*v1.Route{{
+			    // use a basic catch-all matcher
+			      Matchers: []*matchers.Matcher{
+			    	  &matchers.Matcher{
+			    	    PathSpecifier: &matchers.Matcher_Prefix{
+			  		  	  Prefix: pathPrefix,
+			  	  		},
+			  	  	},
+			    	},
+
+				    Options: &v1.RouteOptions{
+              HostRewriteType: &v1.RouteOptions_AutoHostRewrite{
+				  		  AutoHostRewrite: &types.BoolValue{
+				  			  Value: autoHostRewrite,
+				  		  },
+				     },
+				    },
+
+			  	  // tell Gloo where to send the requests
+			  	  Action: &v1.Route_RouteAction{
+			      	RouteAction: &v1.RouteAction{
+			      		Destination: &v1.RouteAction_Single{
+		  	  	 			// single destination
+		  	  	 			Single: &v1.Destination{
+		  	  	 				DestinationType: &v1.Destination_Upstream{
+		  	  		  			// a "reference" to the upstream, which is a Namespace/Name tuple
+		  	  	  				Upstream: &upstreamRef,
+		  	  	  			},
+	  		  	      },
+                },
               },
             },
-					},
-				},
-			}},
-		}
+          }},
+        }
 
-		virtualHosts = append(virtualHosts, vHostForUpstream)
-	}
+				//for _, tag := range upstream.GetConsul().ServiceTags {
+			  //  if tag == "healthcheck=true" {
+				//    healthCheck := &v1.VirtualHost{
+			  //  }
+			  //}
+
+	  	  virtualHosts = append(virtualHosts, vHostForUpstream)
+			}
+	  }
+  }
 
 	desiredProxy := &v1.Proxy{
 		// metadata will be translated to Kubernetes ObjectMeta
-		Metadata: core.Metadata{Namespace: "gloo-system", Name: "my-cool-proxy"},
+		Metadata: core.Metadata{Namespace: "gloo-system", Name: "combined-proxy"},
 
 		// we have the option of creating multiple listeners,
 		// but for the purpose of this example we'll just use one
@@ -208,7 +265,6 @@ func makeDesiredProxy(upstreams v1.UpstreamList) *v1.Proxy {
 			}},
 		},
 	}
-
 	return desiredProxy
 }
 
